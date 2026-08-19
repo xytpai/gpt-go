@@ -19,8 +19,7 @@ Implemented features:
 
 ```bash
 python -m pip install -r requirements.txt
-huggingface-cli download Qwen/Qwen3-30B-A3B-Instruct-2507 \
-  --local-dir /models/Qwen3-30B-A3B-Instruct-2507
+hf download Qwen/Qwen3-30B-A3B-Instruct-2507 --local-dir ${YOUR_DIR}/Qwen3-30B-A3B-Instruct-2507
 ```
 
 ## Run
