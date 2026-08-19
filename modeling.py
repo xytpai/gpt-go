@@ -24,23 +24,18 @@ class ModelArgs:
     n_layers: int = 48
     n_heads: int = 32
     n_kv_heads: int = 4
+    head_dim: int = 128
     vocab_size: int = 151936
-    multiple_of: int = 256
-    ffn_dim_multiplier: Optional[float] = None
+    moe_intermediate_size: int = 768
     norm_eps: float = 1e-6
     rope_theta: float = 10_000_000.0
     max_seq_len: int = 4096
     dropout_prob: float = 0.0
     dtype: torch.dtype = torch.bfloat16
-    rope_interval_split: bool = False
-    use_qk_norm: bool = True
-    explicit_ffn_dim: Optional[int] = 768
-    head_dim: Optional[int] = 128
     num_experts: int = 128
     num_activated_experts: int = 8
     norm_experts_prob: bool = True
     eos_token_ids: tuple[int, ...] = (151645, 151643)
-    ignore_index: int = -100
 
     @classmethod
     def from_hf_config(
@@ -79,7 +74,7 @@ class ModelArgs:
                 config["hidden_size"] // config["num_attention_heads"],
             ),
             vocab_size=config["vocab_size"],
-            explicit_ffn_dim=config["moe_intermediate_size"],
+            moe_intermediate_size=config["moe_intermediate_size"],
             norm_eps=config["rms_norm_eps"],
             rope_theta=config["rope_theta"],
             max_seq_len=(
@@ -89,8 +84,6 @@ class ModelArgs:
             ),
             dropout_prob=config.get("attention_dropout", 0.0),
             dtype=dtype or config_dtype,
-            rope_interval_split=False,
-            use_qk_norm=True,
             num_experts=config["num_experts"],
             num_activated_experts=config["num_experts_per_tok"],
             norm_experts_prob=config.get("norm_topk_prob", True),
@@ -134,24 +127,20 @@ class Attention(nn.Module):
         super().__init__()
         assert args.dim % args.n_heads == 0
         self.dropout_prob = args.dropout_prob
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_kv_heads = args.n_kv_heads
         parallel_size = get_tensor_parallel_world_size()
         self.n_local_heads = args.n_heads // parallel_size
         self.n_local_kv_heads = self.n_kv_heads // parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.head_dim if args.head_dim else args.dim // args.n_heads
+        self.head_dim = args.head_dim
         # weights
         self.wq = ColumnParallelLinear(args.dim, args.n_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
         self.wk = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
         self.wv = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
         self.wo = RowParallelLinear(args.n_heads * self.head_dim, args.dim, bias=False, dtype=args.dtype, device=device, input_is_parallel=True)
-        # qk norm
-        self.use_qk_norm = args.use_qk_norm
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
-            self.k_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
+        self.q_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
+        self.k_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
         self.kv_cache = None
-        self.rope_interval_split = args.rope_interval_split
 
     @staticmethod
     def precompute_freqs_cis(head_dim: int, max_position_embeddings: int, theta: float = 10000.0):
@@ -166,11 +155,7 @@ class Attention(nn.Module):
         sin = sin.unsqueeze(-2)  # F[t, 1, head_dim/2]
 
         def apply(x):
-            if self.rope_interval_split:
-                x1, x2 = torch.chunk(x.reshape(*x.shape[:-1], -1, 2), 2, dim=-1)
-                x1, x2 = x1.squeeze(-1), x2.squeeze(-1)
-            else:
-                x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+            x1, x2 = torch.chunk(x.float(), 2, dim=-1)
             y1 = x1 * cos - x2 * sin
             y2 = x2 * cos + x1 * sin
             return torch.cat((y1, y2), dim=-1)
@@ -189,9 +174,8 @@ class Attention(nn.Module):
         xq = xq.view(batch_size, seq_length, -1, self.head_dim)
         xk = xk.view(batch_size, seq_length, -1, self.head_dim)
         xv = xv.view(batch_size, seq_length, -1, self.head_dim)
-        if self.use_qk_norm:
-            xq = self.q_norm(xq)
-            xk = self.k_norm(xk)
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
         # Apply RoPE
         xq, xk = self.apply_rotary_emb(xq, xk, cos, sin)
         # Refine xq, xk and xv shape
@@ -209,31 +193,10 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
-def refine_hidden_dim(
-    explicit_ffn_dim,
-    hidden_dim,
-    multiple_of=256,
-    ffn_dim_multiplier=None,
-):
-    if explicit_ffn_dim is not None:
-        return explicit_ffn_dim
-    hidden_dim = int(2 * hidden_dim / 3)
-    if ffn_dim_multiplier is not None:
-        hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    return hidden_dim
-
-
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs, device: str):
         super().__init__()
-        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        hidden_dim = refine_hidden_dim(
-            args.explicit_ffn_dim,
-            4 * args.dim,
-            args.multiple_of,
-            args.ffn_dim_multiplier,
-        )
+        hidden_dim = args.moe_intermediate_size
         self.w1 = ColumnParallelLinear(args.dim, hidden_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
         self.w2 = RowParallelLinear(hidden_dim, args.dim, bias=False, dtype=args.dtype, device=device, input_is_parallel=True)
         self.w3 = ColumnParallelLinear(args.dim, hidden_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
@@ -349,7 +312,7 @@ class Transformer(nn.Module):
             device=device,
             gather_output=True,
         )
-        self.head_dim = args.head_dim if args.head_dim else args.dim // args.n_heads
+        self.head_dim = args.head_dim
         self.cos, self.sin = Attention.precompute_freqs_cis(
             self.head_dim,
             self.max_seq_len * 2,
