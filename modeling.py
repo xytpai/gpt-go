@@ -7,15 +7,13 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 from torch import Tensor
 from transformers import AutoTokenizer
 
-import distributed_utils as dutils
+from distributed_utils import get_tensor_parallel_world_size
 from map_state_names import map_qwen3_moe_name
 from tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
@@ -26,14 +24,18 @@ class ModelArgs:
     n_layers: int = 48
     n_heads: int = 32
     n_kv_heads: int = 4
-    head_dim: int = 128
     vocab_size: int = 151936
-    moe_intermediate_size: int = 768
+    multiple_of: int = 256
+    ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-6
     rope_theta: float = 10_000_000.0
-    max_seq_len: int = 262144
+    max_seq_len: int = 4096
     dropout_prob: float = 0.0
     dtype: torch.dtype = torch.bfloat16
+    rope_interval_split: bool = False
+    use_qk_norm: bool = True
+    explicit_ffn_dim: Optional[int] = 768
+    head_dim: Optional[int] = 128
     num_experts: int = 128
     num_activated_experts: int = 8
     norm_experts_prob: bool = True
@@ -57,7 +59,10 @@ class ModelArgs:
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        config_dtype = dtype_by_name.get(config.get("torch_dtype"), torch.bfloat16)
+        config_dtype = dtype_by_name.get(
+            config.get("torch_dtype", config.get("dtype")),
+            torch.bfloat16,
+        )
         eos_token_ids = config.get("eos_token_id", (151645, 151643))
         if isinstance(eos_token_ids, int):
             eos_token_ids = (eos_token_ids,)
@@ -74,12 +79,18 @@ class ModelArgs:
                 config["hidden_size"] // config["num_attention_heads"],
             ),
             vocab_size=config["vocab_size"],
-            moe_intermediate_size=config["moe_intermediate_size"],
+            explicit_ffn_dim=config["moe_intermediate_size"],
             norm_eps=config["rms_norm_eps"],
             rope_theta=config["rope_theta"],
-            max_seq_len=max_seq_len or config["max_position_embeddings"],
+            max_seq_len=(
+                max_seq_len
+                if max_seq_len is not None
+                else min(config["max_position_embeddings"], 4096)
+            ),
             dropout_prob=config.get("attention_dropout", 0.0),
             dtype=dtype or config_dtype,
+            rope_interval_split=False,
+            use_qk_norm=True,
             num_experts=config["num_experts"],
             num_activated_experts=config["num_experts_per_tok"],
             norm_experts_prob=config.get("norm_topk_prob", True),
@@ -88,353 +99,247 @@ class ModelArgs:
 
 
 class KVCache(nn.Module):
-    def __init__(
-        self,
-        max_batch_size: int,
-        max_seq_length: int,
-        n_heads: int,
-        head_size: int,
-        dtype: torch.dtype,
-        device: str | torch.device,
-    ):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_size, dtype, device):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_size)
-        self.register_buffer(
-            "k_cache", torch.empty(cache_shape, dtype=dtype, device=device)
-        )
-        self.register_buffer(
-            "v_cache", torch.empty(cache_shape, dtype=dtype, device=device)
-        )
-        self.cache_length = 0
+        self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype, device=device))
+        self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype, device=device))
 
-    def update(
-        self, input_pos: Tensor, k_val: Tensor, v_val: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        end_pos = int(input_pos.max().item()) + 1
-        if end_pos > self.k_cache.size(2):
-            raise ValueError(
-                f"KV cache length {end_pos} exceeds maximum {self.k_cache.size(2)}"
-            )
-        self.k_cache[: k_val.size(0), :, input_pos] = k_val
-        self.v_cache[: v_val.size(0), :, input_pos] = v_val
-        self.cache_length = max(self.cache_length, end_pos)
-        return (
-            self.k_cache[: k_val.size(0), :, : self.cache_length],
-            self.v_cache[: v_val.size(0), :, : self.cache_length],
-        )
+    def update(self, input_pos: Tensor, k_val, v_val):
+        # input_pos: L[t]
+        # k_val, v_val: F[b, nh, t, hs]
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+        return k_out, v_out
 
 
 class RMSNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        norm_eps: float,
-        dtype: torch.dtype,
-        device: str | torch.device,
-    ):
+    def __init__(self, dim, norm_eps, dtype, device):
         super().__init__()
         self.eps = norm_eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device=device))
+        self.weight = torch.nn.Parameter(torch.ones(dim, dtype=dtype, device=device))
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x):
         input_dtype = x.dtype
-        x_float = x.float()
-        x_norm = x_float * torch.rsqrt(
-            x_float.pow(2).mean(-1, keepdim=True) + self.eps
-        )
-        return self.weight * x_norm.to(input_dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        head_dim: int,
-        theta: float,
-        device: str | torch.device,
-    ):
-        super().__init__()
-        inv_freq = 1.0 / (
-            theta
-            ** (
-                torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-                / head_dim
-            )
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, input_pos: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        freqs = torch.outer(input_pos.float(), self.inv_freq.float())
-        embeddings = torch.cat((freqs, freqs), dim=-1)
-        return embeddings.cos().to(dtype), embeddings.sin().to(dtype)
-
-
-def rotate_half(x: Tensor) -> Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_emb(
-    xq: Tensor, xk: Tensor, cos: Tensor, sin: Tensor
-) -> tuple[Tensor, Tensor]:
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-    return (
-        xq * cos + rotate_half(xq) * sin,
-        xk * cos + rotate_half(xk) * sin,
-    )
+        variance = x.float().pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x.to(input_dtype)
+        return self.weight * x
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, device: str | torch.device):
+    def __init__(self, args: ModelArgs, device: str):
         super().__init__()
-        parallel_size = dutils.get_tensor_parallel_world_size()
-        dutils.ensure_divisibility(args.n_heads, parallel_size)
-        dutils.ensure_divisibility(args.n_kv_heads, parallel_size)
-
+        assert args.dim % args.n_heads == 0
         self.dropout_prob = args.dropout_prob
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        parallel_size = get_tensor_parallel_world_size()
         self.n_local_heads = args.n_heads // parallel_size
-        self.n_local_kv_heads = args.n_kv_heads // parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.head_dim
+        self.head_dim = args.head_dim if args.head_dim else args.dim // args.n_heads
+        # weights
+        self.wq = ColumnParallelLinear(args.dim, args.n_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
+        self.wk = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
+        self.wv = ColumnParallelLinear(args.dim, self.n_kv_heads * self.head_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
+        self.wo = RowParallelLinear(args.n_heads * self.head_dim, args.dim, bias=False, dtype=args.dtype, device=device, input_is_parallel=True)
+        # qk norm
+        self.use_qk_norm = args.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
+            self.k_norm = RMSNorm(self.head_dim, args.norm_eps, args.dtype, device)
+        self.kv_cache = None
+        self.rope_interval_split = args.rope_interval_split
 
-        self.wq = ColumnParallelLinear(
-            args.dim,
-            args.n_heads * args.head_dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            gather_output=False,
-        )
-        self.wk = ColumnParallelLinear(
-            args.dim,
-            args.n_kv_heads * args.head_dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            gather_output=False,
-        )
-        self.wv = ColumnParallelLinear(
-            args.dim,
-            args.n_kv_heads * args.head_dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            gather_output=False,
-        )
-        self.wo = RowParallelLinear(
-            args.n_heads * args.head_dim,
-            args.dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            input_is_parallel=True,
-        )
-        self.q_norm = RMSNorm(args.head_dim, args.norm_eps, args.dtype, device)
-        self.k_norm = RMSNorm(args.head_dim, args.norm_eps, args.dtype, device)
-        self.rotary_emb = RotaryEmbedding(args.head_dim, args.rope_theta, device)
-        self.kv_cache: Optional[KVCache] = None
+    @staticmethod
+    def precompute_freqs_cis(head_dim: int, max_position_embeddings: int, theta: float = 10000.0):
+        inv_freqs = 1.0 / (theta ** (
+            torch.arange(0, head_dim, 2, dtype=torch.int64)[: (head_dim // 2)].float() / head_dim))
+        t = torch.arange(max_position_embeddings, device=inv_freqs.device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freqs)  # F(max_position_embeddings, head_dim/2)
+        return freqs.cos(), freqs.sin()
 
-    def forward(self, x: Tensor, input_pos: Tensor) -> Tensor:
-        batch_size, seq_length, _ = x.shape
+    def apply_rotary_emb(self, xq, xk, cos, sin):
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)  # F[t, 1, head_dim/2]
 
-        xq = self.wq(x).view(
-            batch_size, seq_length, self.n_local_heads, self.head_dim
-        )
-        xk = self.wk(x).view(
-            batch_size, seq_length, self.n_local_kv_heads, self.head_dim
-        )
-        xv = self.wv(x).view(
-            batch_size, seq_length, self.n_local_kv_heads, self.head_dim
-        )
-        xq = self.q_norm(xq).transpose(1, 2)
-        xk = self.k_norm(xk).transpose(1, 2)
-        xv = xv.transpose(1, 2)
+        def apply(x):
+            if self.rope_interval_split:
+                x1, x2 = torch.chunk(x.reshape(*x.shape[:-1], -1, 2), 2, dim=-1)
+                x1, x2 = x1.squeeze(-1), x2.squeeze(-1)
+            else:
+                x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+            y1 = x1 * cos - x2 * sin
+            y2 = x2 * cos + x1 * sin
+            return torch.cat((y1, y2), dim=-1)
 
-        cos, sin = self.rotary_emb(input_pos, xq.dtype)
-        xq, xk = apply_rotary_emb(xq, xk, cos, sin)
+        xq_out = apply(xq)
+        xk_out = apply(xk)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
+    def forward(self, x, attention_mask, cos, sin, input_pos: Optional[Tensor] = None, xa: Optional[Tensor] = None):
+        batch_size, seq_length, _ = x.size()
+        # Infer xq, xk and xv
+        xq = self.wq(x)
+        x_for_kv = x if xa is None else xa
+        xk = self.wk(x_for_kv)
+        xv = self.wv(x_for_kv)
+        xq = xq.view(batch_size, seq_length, -1, self.head_dim)
+        xk = xk.view(batch_size, seq_length, -1, self.head_dim)
+        xv = xv.view(batch_size, seq_length, -1, self.head_dim)
+        if self.use_qk_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+        # Apply RoPE
+        xq, xk = self.apply_rotary_emb(xq, xk, cos, sin)
+        # Refine xq, xk and xv shape
+        xq, xk, xv = [item.transpose(1, 2).contiguous() for item in [xq, xk, xv]]
         if self.kv_cache is not None:
             xk, xv = self.kv_cache.update(input_pos, xk, xv)
-
         xk = xk.repeat_interleave(self.n_rep, dim=1)
         xv = xv.repeat_interleave(self.n_rep, dim=1)
-        key_length = xk.size(2)
-
-        starts_at_zero = int(input_pos[0].item()) == 0
-        is_prefill = starts_at_zero and seq_length == key_length
-        attention_mask = None
-        if not is_prefill and seq_length > 1:
-            key_positions = torch.arange(key_length, device=x.device)
-            attention_mask = (
-                key_positions[None, None, None, :]
-                <= input_pos[None, None, :, None]
-            )
-
+        # DSPA
         output = F.scaled_dot_product_attention(
-            xq,
-            xk,
-            xv,
-            attn_mask=attention_mask,
-            dropout_p=self.dropout_prob if self.training else 0.0,
-            is_causal=is_prefill,
+            xq, xk, xv, attn_mask=attention_mask, dropout_p=self.dropout_prob
         )
-        output = (
-            output.transpose(1, 2)
-            .contiguous()
-            .view(batch_size, seq_length, -1)
-        )
+        # Infer output
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
         return self.wo(output)
 
 
-class FeedForward(nn.Module):
-    def __init__(
-        self,
-        args: ModelArgs,
-        device: str | torch.device,
-        reduce_output: bool,
-    ):
-        super().__init__()
-        hidden_dim = args.moe_intermediate_size
-        self.w1 = ColumnParallelLinear(
-            args.dim,
-            hidden_dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            gather_output=False,
-        )
-        self.w2 = RowParallelLinear(
-            hidden_dim,
-            args.dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            input_is_parallel=True,
-            reduce_output=reduce_output,
-        )
-        self.w3 = ColumnParallelLinear(
-            args.dim,
-            hidden_dim,
-            bias=False,
-            dtype=args.dtype,
-            device=device,
-            gather_output=False,
-        )
+def refine_hidden_dim(
+    explicit_ffn_dim,
+    hidden_dim,
+    multiple_of=256,
+    ffn_dim_multiplier=None,
+):
+    if explicit_ffn_dim is not None:
+        return explicit_ffn_dim
+    hidden_dim = int(2 * hidden_dim / 3)
+    if ffn_dim_multiplier is not None:
+        hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+    return hidden_dim
 
-    def forward(self, x: Tensor) -> Tensor:
+
+class FeedForward(nn.Module):
+    def __init__(self, args: ModelArgs, device: str):
+        super().__init__()
+        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        hidden_dim = refine_hidden_dim(
+            args.explicit_ffn_dim,
+            4 * args.dim,
+            args.multiple_of,
+            args.ffn_dim_multiplier,
+        )
+        self.w1 = ColumnParallelLinear(args.dim, hidden_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
+        self.w2 = RowParallelLinear(hidden_dim, args.dim, bias=False, dtype=args.dtype, device=device, input_is_parallel=True)
+        self.w3 = ColumnParallelLinear(args.dim, hidden_dim, bias=False, dtype=args.dtype, device=device, gather_output=False)
+
+    def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class Router(nn.Module):
-    def __init__(self, args: ModelArgs, device: str | torch.device):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(
-                args.num_experts,
-                args.dim,
-                dtype=args.dtype,
-                device=device,
-            )
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight)
-
-
 class MOEFeedForward(nn.Module):
-    def __init__(self, args: ModelArgs, device: str | torch.device):
+    def __init__(self, args: ModelArgs, device: str):
         super().__init__()
         self.num_experts = args.num_experts
         self.num_activated_experts = args.num_activated_experts
         self.norm_experts_prob = args.norm_experts_prob
-        self.gate = Router(args, device)
-        # Expert outputs are reduced once after routing instead of once per expert.
+        self.gate = nn.Linear(
+            args.dim,
+            args.num_experts,
+            bias=False,
+            dtype=args.dtype,
+            device=device,
+        )
         self.experts = nn.ModuleList(
-            [
-                FeedForward(args, device, reduce_output=False)
-                for _ in range(args.num_experts)
-            ]
+            [FeedForward(args, device) for _ in range(args.num_experts)]
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x):
         batch_size, seq_length, dim = x.shape
-        flat_x = x.view(-1, dim)
-        router_logits = self.gate(flat_x)
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.num_activated_experts, dim=-1
-        )
+        x = x.view(-1, dim)
+        routing_weights = F.softmax(self.gate(x), dim=-1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.num_activated_experts, dim=-1)
         if self.norm_experts_prob:
-            routing_weights = routing_weights / routing_weights.sum(
-                dim=-1, keepdim=True
-            )
-        routing_weights = routing_weights.to(flat_x.dtype)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(x.dtype)
 
-        output = torch.zeros_like(flat_x)
-        expert_mask = F.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero().flatten()
-
-        for expert_idx_tensor in expert_hit:
-            expert_idx = int(expert_idx_tensor.item())
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = flat_x[token_idx]
-            current_state = self.experts[expert_idx](current_state)
-            current_state = (
-                current_state * routing_weights[token_idx, top_k_pos, None]
-            )
-            output.index_add_(0, token_idx, current_state.to(output.dtype))
-
-        output = dutils.reduce_from_tensor_parallel_region(output)
-        return output.view(batch_size, seq_length, dim)
+        output = torch.zeros((batch_size * seq_length, dim), dtype=x.dtype, device=x.device)
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = x[None, top_x].reshape(-1, dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            output.index_add_(0, top_x, current_hidden_states.to(x.dtype))
+        output = output.reshape(batch_size, seq_length, dim)
+        return output
 
 
 class TransformerBlock(nn.Module):
-    def __init__(
-        self,
-        layer_id: int,
-        args: ModelArgs,
-        device: str | torch.device,
-    ):
+    def __init__(self, layer_id: int, args: ModelArgs, device: str):
         super().__init__()
-        self.layer_id = layer_id
         self.attention = Attention(args, device)
+        if getattr(args, "enable_visual", None):
+            self.visual_attention = Attention(args, device)
+            self.visual_norm = RMSNorm(args.dim, args.norm_eps, args.dtype, device)
+            self.enable_visual = True
+        else:
+            self.enable_visual = False
+        if getattr(args, "enable_audio", None):
+            self.audio_attention = Attention(args, device)
+            self.audio_norm = RMSNorm(args.dim, args.norm_eps, args.dtype, device)
+            self.enable_audio = True
+        else:
+            self.enable_audio = False
+        self.layer_id = layer_id
         self.feed_forward = MOEFeedForward(args, device)
         self.attention_norm = RMSNorm(args.dim, args.norm_eps, args.dtype, device)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps, args.dtype, device)
 
-    def forward(self, x: Tensor, input_pos: Tensor) -> Tensor:
-        x = x + self.attention(self.attention_norm(x), input_pos)
-        return x + self.feed_forward(self.ffn_norm(x))
+    def forward(
+        self,
+        x,
+        attention_mask,
+        cos,
+        sin,
+        input_pos: Optional[Tensor] = None,
+        xa: Optional[Tensor] = None,
+    ):
+        x = x + self.attention(
+            self.attention_norm(x), attention_mask, cos, sin, input_pos
+        )
+        if self.enable_visual:
+            x = x + self.visual_attention(
+                self.visual_norm(x), attention_mask, cos, sin, input_pos, xa
+            )
+        if self.enable_audio:
+            x = x + self.audio_attention(
+                self.audio_norm(x), attention_mask, cos, sin, input_pos, xa
+            )
+        out = x + self.feed_forward(self.ffn_norm(x))
+        return out
 
 
 class Transformer(nn.Module):
-    def __init__(
-        self,
-        args: ModelArgs,
-        device: str | torch.device = "cuda:0",
-    ):
+    def __init__(self, args: ModelArgs, device="cuda:0"):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
         self.max_seq_len = args.max_seq_len
-
-        embedding_weight = torch.empty(
+        self.tok_embeddings = nn.Embedding(
             args.vocab_size, args.dim, dtype=args.dtype, device=device
         )
-        self.tok_embeddings = nn.Embedding(
-            args.vocab_size,
-            args.dim,
-            _weight=embedding_weight,
-        )
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(layer_id, args, device)
-                for layer_id in range(args.n_layers)
-            ]
-        )
+        self.layers = nn.ModuleList([
+            TransformerBlock(layer_id, args, device)
+            for layer_id in range(args.n_layers)
+        ])
         self.norm = RMSNorm(args.dim, args.norm_eps, args.dtype, device)
         self.output = ColumnParallelLinear(
             args.dim,
@@ -444,60 +349,69 @@ class Transformer(nn.Module):
             device=device,
             gather_output=True,
         )
+        self.head_dim = args.head_dim if args.head_dim else args.dim // args.n_heads
+        self.cos, self.sin = Attention.precompute_freqs_cis(
+            self.head_dim,
+            self.max_seq_len * 2,
+            args.rope_theta,
+        )
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(
+                torch.ones(
+                    self.max_seq_len,
+                    self.max_seq_len,
+                    dtype=torch.bool,
+                    device=device,
+                )
+            ),
+            persistent=False,
+        )
 
-    @property
-    def device(self) -> torch.device:
+    def device(self):
         return self.output.weight.device
 
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.output.weight.dtype
+    def dtype(self):
+        return self.args.dtype
 
-    def size(self) -> int:
+    def size(self):
         return sum(parameter.numel() for parameter in self.parameters())
 
-    def assign_kv_cache(
-        self, max_batch_size: int, cache_seq_len: Optional[int] = None
-    ) -> None:
-        cache_seq_len = cache_seq_len or self.max_seq_len
-        if cache_seq_len > self.max_seq_len:
-            raise ValueError(
-                f"KV cache length {cache_seq_len} exceeds "
-                f"max_seq_len={self.max_seq_len}"
-            )
-        parallel_size = dutils.get_tensor_parallel_world_size()
-        local_kv_heads = self.args.n_kv_heads // parallel_size
+    def assign_kv_cache(self, max_batch_size):
         for layer in self.layers:
             layer.attention.kv_cache = KVCache(
                 max_batch_size,
-                cache_seq_len,
-                local_kv_heads,
-                self.args.head_dim,
-                self.dtype,
-                self.device,
+                self.max_seq_len,
+                self.args.n_kv_heads,
+                self.head_dim,
+                self.dtype(),
+                self.device(),
             )
 
     def forward(
         self,
-        tokens: Tensor,
+        tokens,
         input_pos: Optional[Tensor] = None,
-        logits_to_keep: int = 0,
-    ) -> Tensor:
-        _, seq_length = tokens.shape
-        if input_pos is None:
-            input_pos = torch.arange(seq_length, device=tokens.device)
-        if int(input_pos.max().item()) >= self.max_seq_len:
-            raise ValueError(
-                f"Position exceeds configured max_seq_len={self.max_seq_len}"
-            )
+        images: Optional[Tensor] = None,
+    ):
+        # tokens: L[b, t]
+        # images: F[b, c, h, w]
+        _, seq_length = tokens.size()
+        h = self.tok_embeddings(tokens)
+        self.cos = self.cos.to(self.device())
+        self.sin = self.sin.to(self.device())
 
-        hidden_states = self.tok_embeddings(tokens)
+        if input_pos is None:
+            input_pos = torch.arange(0, seq_length, device=self.device())
+            cos, sin = self.cos[input_pos], self.sin[input_pos]
+            causal_mask = self.causal_mask[None, None, :seq_length, :seq_length]
+        else:
+            cos, sin = self.cos[input_pos], self.sin[input_pos]
+            causal_mask = self.causal_mask[None, None, input_pos]
         for layer in self.layers:
-            hidden_states = layer(hidden_states, input_pos)
-        hidden_states = self.norm(hidden_states)
-        if logits_to_keep > 0:
-            hidden_states = hidden_states[:, -logits_to_keep:, :]
-        return self.output(hidden_states)
+            h = layer(h, causal_mask, cos, sin, input_pos)
+        h = self.norm(h)
+        return self.output(h)
 
     @staticmethod
     def post_loss(logits: Tensor, target_ids: Tensor, ignore_index: int = -100):
@@ -507,24 +421,10 @@ class Transformer(nn.Module):
             ignore_index=ignore_index,
         )
 
-
-def _partition_dimension(name: str) -> Optional[int]:
-    column_suffixes = (
-        ".attention.wq.weight",
-        ".attention.wk.weight",
-        ".attention.wv.weight",
-        ".w1.weight",
-        ".w3.weight",
-    )
-    row_suffixes = (
-        ".attention.wo.weight",
-        ".w2.weight",
-    )
-    if name == "output.weight" or name.endswith(column_suffixes):
-        return 0
-    if name.endswith(row_suffixes):
-        return 1
-    return None
+    @staticmethod
+    def post_pred(h, temperature):
+        h = h[:, -1, :] / temperature
+        return torch.multinomial(F.softmax(h, dim=-1), num_samples=1)
 
 
 @torch.no_grad()
@@ -534,7 +434,7 @@ def load_qwen3_moe_checkpoint(model: Transformer, model_dir: str | Path) -> None
     if index_path.exists():
         with index_path.open("r", encoding="utf-8") as file:
             weight_map = json.load(file)["weight_map"]
-        shard_names = list(dict.fromkeys(weight_map.values()))
+        shard_names = sorted(set(weight_map.values()))
     else:
         shard_names = [path.name for path in sorted(model_dir.glob("*.safetensors"))]
         if not shard_names:
@@ -544,15 +444,12 @@ def load_qwen3_moe_checkpoint(model: Transformer, model_dir: str | Path) -> None
 
     parameters = dict(model.named_parameters())
     missing = set(parameters)
-    tp_size = dutils.get_tensor_parallel_world_size()
-    tp_rank = dutils.get_tensor_parallel_rank()
 
     for shard_index, shard_name in enumerate(shard_names, start=1):
         shard_path = model_dir / shard_name
         if not shard_path.exists():
             raise FileNotFoundError(shard_path)
-        if tp_rank == 0:
-            print(f"Loading shard {shard_index}/{len(shard_names)}: {shard_name}")
+        print(f"Loading shard {shard_index}/{len(shard_names)}: {shard_name}")
 
         with safe_open(shard_path, framework="pt", device="cpu") as checkpoint:
             for source_name in checkpoint.keys():
@@ -565,13 +462,6 @@ def load_qwen3_moe_checkpoint(model: Transformer, model_dir: str | Path) -> None
                     )
 
                 tensor = checkpoint.get_tensor(source_name)
-                partition_dim = _partition_dimension(target_name)
-                if partition_dim is not None and tp_size > 1:
-                    dutils.ensure_divisibility(
-                        tensor.size(partition_dim), tp_size
-                    )
-                    tensor = tensor.chunk(tp_size, dim=partition_dim)[tp_rank]
-
                 if tuple(tensor.shape) != tuple(parameter.shape):
                     raise ValueError(
                         f"Shape mismatch for {source_name}: checkpoint "
@@ -621,28 +511,20 @@ class WorkerProc:
     def __init__(
         self,
         model_dir: str,
-        world_size: int,
-        tp_size: int,
-        max_seq_len: Optional[int],
+        max_seq_len: int,
         max_new_tokens: int,
         temperature: float,
         top_p: float,
         top_k: int,
         dtype: Optional[torch.dtype],
-        init_url: Optional[str],
-        backend: Optional[str],
     ):
         self.model_dir = model_dir
-        self.world_size = world_size
-        self.tp_size = tp_size
         self.max_seq_len = max_seq_len
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
         self.dtype = dtype
-        self.init_url = init_url
-        self.backend = backend
 
     @torch.inference_mode()
     def generate(self, rank: int, model: Transformer, input_text: str) -> None:
@@ -658,7 +540,14 @@ class WorkerProc:
             return_tensors="pt",
             return_dict=True,
         )
-        tokens = encoded["input_ids"].to(model.device)
+        input_ids = encoded["input_ids"] if hasattr(encoded, "keys") else encoded
+        tokens = torch.as_tensor(
+            input_ids,
+            dtype=torch.long,
+            device=model.device(),
+        )
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
         prompt_length = tokens.size(1)
         if prompt_length + self.max_new_tokens > model.max_seq_len:
             raise ValueError(
@@ -666,35 +555,38 @@ class WorkerProc:
                 f"exceeds max_seq_len={model.max_seq_len}"
             )
 
-        model.assign_kv_cache(
-            max_batch_size=1,
-            cache_seq_len=prompt_length + self.max_new_tokens,
-        )
-        input_pos = torch.arange(tokens.size(1), device=model.device)
+        model.assign_kv_cache(1)
+        input_pos = torch.arange(tokens.size(1), device=model.device())
         generated: list[int] = []
+        streamed_text = ""
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize(model.device)
+            torch.cuda.synchronize(model.device())
         start_time = time.perf_counter()
 
         for step in range(self.max_new_tokens):
-            logits = model(tokens, input_pos, logits_to_keep=1)[:, -1, :]
-            if rank == 0:
-                next_token = sample_next_token(
-                    logits,
-                    self.temperature,
-                    self.top_p,
-                    self.top_k,
-                )
-            else:
-                next_token = torch.empty(
-                    (1, 1), dtype=torch.long, device=model.device
-                )
-            if self.world_size > 1:
-                dist.broadcast(next_token, src=0)
+            logits = model(tokens, input_pos)[:, -1, :]
+            next_token = sample_next_token(
+                logits,
+                self.temperature,
+                self.top_p,
+                self.top_k,
+            )
 
             token_id = int(next_token.item())
             generated.append(token_id)
+            decoded_text = tokenizer.decode(
+                generated,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).rstrip("\ufffd")
+            if decoded_text.startswith(streamed_text):
+                print(
+                    decoded_text[len(streamed_text) :],
+                    end="",
+                    flush=True,
+                )
+                streamed_text = decoded_text
             if token_id in model.args.eos_token_ids:
                 break
 
@@ -702,34 +594,33 @@ class WorkerProc:
             input_pos = torch.tensor(
                 [prompt_length + step],
                 dtype=torch.long,
-                device=model.device,
+                device=model.device(),
             )
 
+        final_text = tokenizer.decode(
+            generated,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if final_text.startswith(streamed_text):
+            print(final_text[len(streamed_text) :], end="", flush=True)
+        print(flush=True)
         if torch.cuda.is_available():
-            torch.cuda.synchronize(model.device)
+            torch.cuda.synchronize(model.device())
         elapsed = time.perf_counter() - start_time
 
         if rank == 0:
-            text = tokenizer.decode(generated, skip_special_tokens=True)
-            print(text)
             print(
                 f"\nGenerated {len(generated)} tokens in {elapsed:.3f}s "
                 f"({len(generated) / elapsed:.2f} tokens/s)"
             )
 
     def __call__(self, rank: int, input_text: str) -> None:
-        dutils.init_tensor_parallel(
-            rank,
-            self.world_size,
-            self.tp_size,
-            backend=self.backend,
-            init_url=self.init_url,
-        )
-        device: str | torch.device
-        if torch.cuda.is_available():
-            device = f"cuda:{rank}"
-        else:
-            device = "cpu"
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "A CUDA or ROCm PyTorch build with an available GPU is required"
+            )
+        device = f"cuda:{rank}"
 
         with open(
             os.path.join(self.model_dir, "config.json"),
@@ -758,13 +649,12 @@ class WorkerProc:
         model.eval()
 
         if rank == 0:
-            local_billions = model.size() / 1_000_000_000
+            billions = model.size() / 1_000_000_000
             print(
                 f"Qwen3-30B-A3B-Instruct-2507: "
-                f"{local_billions:.3f}B parameters on each TP rank"
+                f"{billions:.3f}B parameters"
             )
         self.generate(rank, model, input_text)
-        dutils.destroy_tensor_parallel()
 
 
 def parse_dtype(value: str) -> Optional[torch.dtype]:
@@ -779,13 +669,11 @@ def parse_dtype(value: str) -> Optional[torch.dtype]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Minimal Qwen3-30B-A3B-Instruct-2507 TP inference"
+        description="Minimal single-GPU Qwen3-30B-A3B-Instruct-2507 inference"
     )
     parser.add_argument("model_dir", help="Local Hugging Face model directory")
     parser.add_argument("prompt", help="User prompt")
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--world-size", type=int)
-    parser.add_argument("--max-seq-len", type=int)
+    parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -795,38 +683,18 @@ def main() -> None:
         choices=("auto", "bfloat16", "float16", "float32"),
         default="auto",
     )
-    parser.add_argument("--init-url")
-    parser.add_argument("--backend", choices=("nccl", "gloo"))
     cli_args = parser.parse_args()
-
-    world_size = cli_args.world_size or cli_args.tp_size
-    if world_size != cli_args.tp_size:
-        raise ValueError(
-            "This minimal runner currently requires world_size == tp_size"
-        )
 
     worker = WorkerProc(
         model_dir=cli_args.model_dir,
-        world_size=world_size,
-        tp_size=cli_args.tp_size,
         max_seq_len=cli_args.max_seq_len,
         max_new_tokens=cli_args.max_new_tokens,
         temperature=cli_args.temperature,
         top_p=cli_args.top_p,
         top_k=cli_args.top_k,
         dtype=parse_dtype(cli_args.dtype),
-        init_url=cli_args.init_url,
-        backend=cli_args.backend,
     )
-    if world_size == 1:
-        worker(0, cli_args.prompt)
-    else:
-        mp.spawn(
-            worker,
-            args=(cli_args.prompt,),
-            nprocs=world_size,
-            join=True,
-        )
+    worker(0, cli_args.prompt)
 
 
 if __name__ == "__main__":
