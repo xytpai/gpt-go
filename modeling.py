@@ -650,25 +650,26 @@ class WorkerProc:
             self.model_dir, trust_remote_code=False
         )
         messages = [{"role": "user", "content": input_text}]
-        input_ids = tokenizer.apply_chat_template(
+        encoded = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             enable_thinking=False,
+            return_tensors="pt",
+            return_dict=True,
         )
-        if len(input_ids) + self.max_new_tokens > model.max_seq_len:
+        tokens = encoded["input_ids"].to(model.device)
+        prompt_length = tokens.size(1)
+        if prompt_length + self.max_new_tokens > model.max_seq_len:
             raise ValueError(
-                f"Prompt ({len(input_ids)}) + output ({self.max_new_tokens}) "
+                f"Prompt ({prompt_length}) + output ({self.max_new_tokens}) "
                 f"exceeds max_seq_len={model.max_seq_len}"
             )
 
         model.assign_kv_cache(
             max_batch_size=1,
-            cache_seq_len=len(input_ids) + self.max_new_tokens,
+            cache_seq_len=prompt_length + self.max_new_tokens,
         )
-        tokens = torch.tensor(
-            input_ids, dtype=torch.long, device=model.device
-        ).unsqueeze(0)
         input_pos = torch.arange(tokens.size(1), device=model.device)
         generated: list[int] = []
 
@@ -699,7 +700,7 @@ class WorkerProc:
 
             tokens = next_token
             input_pos = torch.tensor(
-                [len(input_ids) + step],
+                [prompt_length + step],
                 dtype=torch.long,
                 device=model.device,
             )
